@@ -1,0 +1,11 @@
+# CMake
+build/
+save/
+log.*
+
+# Reference
+/legacy/
+*.log
+
+# Local assets (models, HDRIs, textures)
+/assets/

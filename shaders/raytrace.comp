@@ -1,0 +1,1446 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, set = 0, binding = 0) uniform image2D accumImage;
+layout(rgba8, set = 0, binding = 6) uniform image2D displayImage;
+
+
+struct Vertex {
+    float position[3];
+    float normal[3];
+    float uv[2];
+};
+
+struct Triangle {
+    uint v0;
+    uint v1;
+    uint v2;
+    uint materialIndex;
+};
+
+struct Material {
+    float baseColor[3];
+    int baseColorSlot;
+    float metallic;
+    float roughness;
+    float transmission;
+    int metallicRoughnessSlot;
+    int normalSlot;
+    int occlusionSlot;
+    int emissiveSlot;
+    float emissive[3];
+    float ior;
+    float thickness;
+    float attenuationColor[3];
+    float attenuationDistance;
+    int thicknessSlot;
+    float baseColorAlpha;
+    int alphaMode;
+    float alphaCutoff;
+    int doubleSided;
+    float emissiveStrength;
+    float specularFactor;
+    float specularColorFactor[3];
+    float clearcoatFactor;
+    float clearcoatRoughness;
+    float normalScale;
+    int flipUvY;
+};
+
+struct TextureSlot {
+    int layer;
+    int wrapS;
+    int wrapT;
+    int magFilter;
+    int minFilter;
+    int transformIndex;
+    int texCoord;
+    int padding;
+};
+
+struct TextureTransform {
+    float offset[2];
+    float rotation;
+    float scale[2];
+    float padding[3];
+};
+
+struct BVHNode {
+    float boundsMin[3];
+    float boundsMax[3];
+    int left;
+    int right;
+    int start;
+    int count;
+};
+
+struct EnvSampleEntry {
+    float probability;
+    uint alias;
+    uint x;
+    uint y;
+    float pdf;
+    float pad0;
+    float pad1;
+    float pad2;
+};
+
+struct GPULight {
+    float position[3];
+    float direction[3];
+    float color[3];
+    float intensity;
+    int type;
+    float spotDirection[3];
+    float spotInnerCos;
+    float spotOuterCos;
+    float areaRight[3];
+    float areaUp[3];
+    float areaHalfWidth;
+    float areaHalfHeight;
+    float _pad[4];
+};
+layout(std430, set = 0, binding = 1) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer BvhBuffer {
+    BVHNode bvhNodes[];
+};
+
+layout(std430, set = 0, binding = 8) readonly buffer LightBuffer {
+    GPULight lights[];
+};
+
+layout(std430, set = 0, binding = 11) readonly buffer EnvSampleBuffer {
+    EnvSampleEntry envSamples[];
+};
+
+layout(std430, set = 0, binding = 14) readonly buffer TextureSlotBuffer {
+    TextureSlot texSlots[];
+};
+
+layout(std430, set = 0, binding = 15) readonly buffer TextureTransformBuffer {
+    TextureTransform texTransforms[];
+};
+
+layout(set = 0, binding = 12) uniform sampler2DArray texturesSrgb;
+layout(set = 0, binding = 13) uniform sampler2DArray texturesLinear;
+layout(set = 0, binding = 7) uniform sampler2D envTexture;
+layout(set = 0, binding = 9) uniform sampler2D irradianceTexture;
+layout(set = 0, binding = 10) uniform sampler2D brdfLutTexture;
+
+// Ray cone slope: world-space footprint radius per unit of ray distance. Set per
+// primary ray in main() and widened by rough bounces.
+float g_ray_spread = 0.001;
+
+// glTF sampler wrap modes are applied arithmetically because every texture layer
+// shares one sampler; the sampler itself clamps.
+float wrap_coordinate(float value, int mode) {
+    if (mode == 1) {
+        return clamp(value, 0.0, 1.0);
+    }
+    if (mode == 2) {
+        float mirrored = mod(abs(value), 2.0);
+        return mirrored > 1.0 ? 2.0 - mirrored : mirrored;
+    }
+    return fract(value);
+}
+
+vec2 apply_texture_transform(vec2 uv, int transformIndex, inout float uv_span) {
+    if (transformIndex < 0) {
+        return uv;
+    }
+    TextureTransform transform = texTransforms[transformIndex];
+    vec2 scale = vec2(transform.scale[0], transform.scale[1]);
+    float angle = transform.rotation;
+    float cos_angle = cos(angle);
+    float sin_angle = sin(angle);
+    vec2 scaled = uv * scale;
+    uv_span *= max(abs(scale.x), abs(scale.y));
+    return vec2(cos_angle * scaled.x - sin_angle * scaled.y,
+                sin_angle * scaled.x + cos_angle * scaled.y) +
+           vec2(transform.offset[0], transform.offset[1]);
+}
+
+float texture_lod(sampler2DArray array, float uv_span) {
+    vec2 size = vec2(textureSize(array, 0));
+    float texels = uv_span * max(size.x, size.y);
+    float max_level = max(float(textureQueryLevels(array) - 1), 0.0);
+    return clamp(log2(max(texels, 1e-8)), 0.0, max_level);
+}
+
+vec4 sample_texture_slot(sampler2DArray array, int slot_index, vec2 uv, float uv_span) {
+    TextureSlot slot = texSlots[slot_index];
+    float span = uv_span;
+    vec2 transformed = apply_texture_transform(uv, slot.transformIndex, span);
+    transformed = vec2(wrap_coordinate(transformed.x, slot.wrapS),
+                       wrap_coordinate(transformed.y, slot.wrapT));
+
+    vec2 size = vec2(textureSize(array, 0));
+    float lod = texture_lod(array, span);
+    bool magnifying = span * max(size.x, size.y) <= 1.0;
+
+    // Nearest is resolved with a texel fetch; otherwise the mip chain filters.
+    if (magnifying ? (slot.magFilter == 0) : (slot.minFilter == 0)) {
+        int level = magnifying ? 0 : int(lod + 0.5);
+        vec2 level_size = vec2(textureSize(array, level));
+        ivec2 texel = clamp(
+            ivec2(floor(transformed * level_size)),
+            ivec2(0),
+            ivec2(level_size) - ivec2(1));
+        return texelFetch(array, ivec3(texel, slot.layer), level);
+    }
+
+    return textureLod(array, vec3(transformed, float(slot.layer)), lod);
+}
+
+// baseColor and emissive live in the sRGB array, where the hardware decodes the
+// gamma curve for us.
+vec4 sample_srgb(int slot_index, vec2 uv, float uv_span) {
+    return sample_texture_slot(texturesSrgb, slot_index, uv, uv_span);
+}
+
+vec4 sample_linear(int slot_index, vec2 uv, float uv_span) {
+    return sample_texture_slot(texturesLinear, slot_index, uv, uv_span);
+}
+layout(push_constant) uniform PushConstants {
+    float time;
+    int frameIndex;
+    float cameraPosition[3];
+    float cameraForward[3];
+    float cameraRight[3];
+    float cameraUp[3];
+    float exposure;
+    int showLightGizmos;
+    float environmentRotation;
+    float environmentIntensity;
+    float environmentPdfScale;
+    int environmentSampleWidth;
+    int environmentSampleHeight;
+    float environmentPad;
+} pc;
+
+
+const int SAMPLES_X = 1;
+const int SAMPLES_Y = 1;
+const int SAMPLE_COUNT = SAMPLES_X * SAMPLES_Y;
+const float PI = 3.14159265359;
+
+float distributionGGX(float ndoth, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-6);
+}
+
+float geometrySchlickGGX(float ndotv, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return ndotv / (ndotv * (1.0 - k) + k);
+}
+
+float geometrySmith(float ndotv, float ndotl, float roughness) {
+    return geometrySchlickGGX(ndotv, roughness) *
+           geometrySchlickGGX(ndotl, roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+}
+
+
+vec3 positionOf(Vertex v) {
+    return vec3(v.position[0], v.position[1], v.position[2]);
+}
+
+vec3 normalOf(Vertex v) {
+    return vec3(v.normal[0], v.normal[1], v.normal[2]);
+}
+
+bool hit_triangle(vec3 v0, vec3 v1, vec3 v2, vec3 ray_origin, vec3 ray_dir,
+                  out float t, out float u, out float v) {
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec3 p = cross(ray_dir, e2);
+    float det = dot(e1, p);
+    if (abs(det) < 1e-6) {
+        return false;
+    }
+
+    float inv_det = 1.0 / det;
+    vec3 tv = ray_origin - v0;
+    u = dot(tv, p) * inv_det;
+    if (u < 0.0 || u > 1.0) {
+        return false;
+    }
+
+    vec3 q = cross(tv, e1);
+    v = dot(ray_dir, q) * inv_det;
+    if (v < 0.0 || u + v > 1.0) {
+        return false;
+    }
+
+    t = dot(e2, q) * inv_det;
+    return true;
+}
+
+bool hit_aabb(BVHNode node, vec3 ray_origin, vec3 ray_dir, float max_t) {
+    float tmin = 0.0;
+    float tmax = max_t;
+
+    if (abs(ray_dir.x) < 1e-8) {
+        if (ray_origin.x < node.boundsMin[0] || ray_origin.x > node.boundsMax[0]) {
+            return false;
+        }
+    } else {
+        float inv = 1.0 / ray_dir.x;
+        float t0 = (node.boundsMin[0] - ray_origin.x) * inv;
+        float t1 = (node.boundsMax[0] - ray_origin.x) * inv;
+        if (inv < 0.0) { float tmp = t0; t0 = t1; t1 = tmp; }
+        tmin = max(tmin, t0);
+        tmax = min(tmax, t1);
+        if (tmin > tmax) return false;
+    }
+
+    if (abs(ray_dir.y) < 1e-8) {
+        if (ray_origin.y < node.boundsMin[1] || ray_origin.y > node.boundsMax[1]) {
+            return false;
+        }
+    } else {
+        float inv = 1.0 / ray_dir.y;
+        float t0 = (node.boundsMin[1] - ray_origin.y) * inv;
+        float t1 = (node.boundsMax[1] - ray_origin.y) * inv;
+        if (inv < 0.0) { float tmp = t0; t0 = t1; t1 = tmp; }
+        tmin = max(tmin, t0);
+        tmax = min(tmax, t1);
+        if (tmin > tmax) return false;
+    }
+
+    if (abs(ray_dir.z) < 1e-8) {
+        if (ray_origin.z < node.boundsMin[2] || ray_origin.z > node.boundsMax[2]) {
+            return false;
+        }
+    } else {
+        float inv = 1.0 / ray_dir.z;
+        float t0 = (node.boundsMin[2] - ray_origin.z) * inv;
+        float t1 = (node.boundsMax[2] - ray_origin.z) * inv;
+        if (inv < 0.0) { float tmp = t0; t0 = t1; t1 = tmp; }
+        tmin = max(tmin, t0);
+        tmax = min(tmax, t1);
+        if (tmin > tmax) return false;
+    }
+
+    return true;
+}
+vec3 rotate_environment_y(vec3 direction, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec3(c * direction.x - s * direction.z,
+                direction.y,
+                s * direction.x + c * direction.z);
+}
+
+vec2 direction_to_uv(vec3 direction) {
+    direction = rotate_environment_y(direction, pc.environmentRotation);
+    float u = atan(direction.z, direction.x) * 0.15915494 + 0.5;
+    float v = acos(clamp(direction.y, -1.0, 1.0)) * 0.31830989;
+    return vec2(u, v);
+}
+
+vec3 sample_environment_lod(vec3 direction, float lod) {
+    return textureLod(envTexture, direction_to_uv(direction), lod).rgb *
+           pc.environmentIntensity;
+}
+
+vec3 sample_irradiance(vec3 direction) {
+    return texture(irradianceTexture, direction_to_uv(direction)).rgb *
+           pc.environmentIntensity;
+}
+
+vec3 environment_color(vec3 direction) {
+    return sample_environment_lod(direction, 0.0);
+}
+
+vec3 env_brdf_approx(vec3 f0, float roughness, float ndotv) {
+    vec2 ab = texture(brdfLutTexture, vec2(ndotv, roughness)).rg;
+    return f0 * ab.x + ab.y;
+}
+bool hit_ground_disk(vec3 ray_origin, vec3 ray_dir, float plane_y,
+                     float radius, out float t, out vec3 point) {
+    if (abs(ray_dir.y) < 1e-8) {
+        return false;
+    }
+    t = (plane_y - ray_origin.y) / ray_dir.y;
+    if (t <= 0.0) {
+        return false;
+    }
+    point = ray_origin + t * ray_dir;
+    if (dot(point.xz, point.xz) > radius * radius) {
+        return false;
+    }
+    return true;
+}
+float random01(vec2 p, float offset);
+
+float material_alpha(Material material, float u, float v,
+                     Vertex a, Vertex b, Vertex c) {
+    float alpha = material.baseColorAlpha;
+    if (material.baseColorSlot >= 0) {
+        float w = 1.0 - u - v;
+        vec2 uv0 = vec2(a.uv[0], a.uv[1]);
+        vec2 uv1 = vec2(b.uv[0], b.uv[1]);
+        vec2 uv2 = vec2(c.uv[0], c.uv[1]);
+        vec2 uv = w * uv0 + u * uv1 + v * uv2;
+        if (material.flipUvY != 0) {
+            uv.y = 1.0 - uv.y;
+        }
+        // Alpha coverage is tested at mip 0 so that cutouts stay crisp.
+        alpha *= sample_srgb(material.baseColorSlot, uv, 0.0).a;
+    }
+    return clamp(alpha, 0.0, 1.0);
+}
+vec3 shadow_transmittance(vec3 ray_origin, vec3 ray_dir,
+                          float t_min, float t_max) {
+    if (bvhNodes.length() == 0) {
+        return vec3(1.0);
+    }
+
+    vec3 throughput = vec3(1.0);
+    // Volumetric hits along the shadow ray, paired up below into segments that
+    // the ray actually travels inside the medium.
+    const int MAX_VOLUME_HITS = 8;
+    float volume_t[MAX_VOLUME_HITS];
+    vec3 volume_color[MAX_VOLUME_HITS];
+    vec3 volume_fallback[MAX_VOLUME_HITS];
+    float volume_distance[MAX_VOLUME_HITS];
+    int volume_count = 0;
+    int stack[128];
+    int stack_size = 0;
+    stack[stack_size++] = 0;
+
+    while (stack_size > 0) {
+        BVHNode node = bvhNodes[stack[--stack_size]];
+        if (!hit_aabb(node, ray_origin, ray_dir, t_max)) {
+            continue;
+        }
+
+        if (node.left < 0) {
+            for (int i = node.start; i < node.start + node.count; ++i) {
+                Triangle tri = triangles[i];
+                Vertex a = vertices[tri.v0];
+                Vertex b = vertices[tri.v1];
+                Vertex c = vertices[tri.v2];
+
+                float t;
+                float u;
+                float v;
+                if (!hit_triangle(positionOf(a), positionOf(b),
+                                  positionOf(c), ray_origin, ray_dir,
+                                  t, u, v)) {
+                    continue;
+                }
+                if (t <= t_min || t >= t_max) {
+                    continue;
+                }
+
+                Material material = materials[tri.materialIndex];
+                float w = 1.0 - u - v;
+                vec3 normal = normalize(w * normalOf(a) +
+                                        u * normalOf(b) +
+                                        v * normalOf(c));
+                // A volume boundary is two-sided: KHR_materials_volume states
+                // that doubleSided has no effect on it.
+                if (material.doubleSided == 0 &&
+                    material.thickness <= 0.0 &&
+                    dot(normal, ray_dir) > 0.0) {
+                    continue;
+                }
+
+                float alpha = material_alpha(material, u, v, a, b, c);
+                if (material.alphaMode == 1 &&
+                    alpha < material.alphaCutoff) {
+                    continue;
+                }
+
+                if (material.transmission > 0.0) {
+                    vec3 tint = vec3(material.baseColor[0],
+                                     material.baseColor[1],
+                                     material.baseColor[2]) *
+                                material.transmission;
+                    throughput *= tint;
+
+                    if (material.thickness > 0.0 &&
+                        material.attenuationDistance < 1e29 &&
+                        volume_count < MAX_VOLUME_HITS) {
+                        volume_t[volume_count] = t;
+                        volume_color[volume_count] = vec3(
+                            material.attenuationColor[0],
+                            material.attenuationColor[1],
+                            material.attenuationColor[2]);
+                        volume_fallback[volume_count] = vec3(
+                            max(material.thickness, 0.0));
+                        volume_distance[volume_count] = max(
+                            material.attenuationDistance, 1e-4);
+                        volume_count++;
+                    }
+                    continue;
+                }
+
+                if (material.alphaMode == 2) {
+                    throughput *= alpha;
+                    continue;
+                }
+
+                return vec3(0.0);
+            }
+        } else {
+            if (node.right >= 0) stack[stack_size++] = node.right;
+            if (node.left >= 0) stack[stack_size++] = node.left;
+        }
+    }
+
+    // Sort the volumetric hits by distance, then integrate absorption over each
+    // entry/exit pair with the spec form T(x) = attenuationColor^(x / d), where
+    // x is the distance the shadow ray really travels inside the medium.
+    for (int i = 0; i < volume_count - 1; ++i) {
+        for (int j = i + 1; j < volume_count; ++j) {
+            if (volume_t[j] < volume_t[i]) {
+                float swap_t = volume_t[i];
+                volume_t[i] = volume_t[j];
+                volume_t[j] = swap_t;
+                vec3 swap_c = volume_color[i];
+                volume_color[i] = volume_color[j];
+                volume_color[j] = swap_c;
+                vec3 swap_f = volume_fallback[i];
+                volume_fallback[i] = volume_fallback[j];
+                volume_fallback[j] = swap_f;
+                float swap_d = volume_distance[i];
+                volume_distance[i] = volume_distance[j];
+                volume_distance[j] = swap_d;
+            }
+        }
+    }
+
+    for (int i = 0; i + 1 < volume_count; i += 2) {
+        float travelled = max(volume_t[i + 1] - volume_t[i], 0.0);
+        throughput *=
+            pow(volume_color[i], vec3(travelled / volume_distance[i]));
+    }
+    if (volume_count % 2 == 1) {
+        // The ray never left the volume: fall back to the authored thickness.
+        int last = volume_count - 1;
+        throughput *= pow(volume_color[last],
+                          volume_fallback[last] / volume_distance[last]);
+    }
+
+    return throughput;
+}
+
+vec3 shadow_attenuation(vec3 point, vec3 light_dir,
+                        float light_distance) {
+    vec3 origin = point + light_dir * 1e-3;
+    float t_max = (light_distance < 1e29)
+                      ? light_distance - 1e-3
+                      : 1e30;
+    if (t_max <= 1e-3) {
+        return vec3(1.0);
+    }
+    return shadow_transmittance(origin, light_dir, 1e-3, t_max);
+}
+vec3 direct_lighting(vec3 N, vec3 V, vec3 point, vec3 base_color,
+                     float metallic, float roughness, vec3 f0,
+                     float clearcoat, float clearcoat_roughness) {
+    vec3 result = vec3(0.0);
+    int light_count = lights.length();
+    for (int i = 0; i < light_count; ++i) {
+        GPULight light = lights[i];
+        if (light.intensity <= 0.0) {
+            continue;
+        }
+
+        vec3 L;
+        float light_distance = 1e30;
+        float spot_attenuation = 1.0;
+        float area_scale = 1.0;
+
+        if (light.type == 0) {
+            L = normalize(vec3(light.direction[0], light.direction[1], light.direction[2]));
+        } else if (light.type == 3) {
+            float u1 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 43.0 + float(i) * 17.0 + 13.0);
+            float u2 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 47.0 + float(i) * 19.0 + 14.0);
+
+            vec3 right = normalize(vec3(
+                light.areaRight[0],
+                light.areaRight[1],
+                light.areaRight[2]));
+            vec3 up = normalize(vec3(
+                light.areaUp[0],
+                light.areaUp[1],
+                light.areaUp[2]));
+            vec3 sample_point =
+                vec3(light.position[0], light.position[1], light.position[2]) +
+                right * ((u1 * 2.0 - 1.0) * light.areaHalfWidth) +
+                up * ((u2 * 2.0 - 1.0) * light.areaHalfHeight);
+
+            vec3 to_light = sample_point - point;
+            light_distance = length(to_light);
+            if (light_distance < 1e-4) {
+                continue;
+            }
+            L = to_light / light_distance;
+
+            vec3 area_normal = normalize(cross(right, up));
+            float cos_light = max(dot(-L, area_normal), 0.0);
+            if (cos_light <= 0.0) {
+                continue;
+            }
+            area_scale = 4.0 * light.areaHalfWidth *
+                         light.areaHalfHeight * cos_light;
+        } else {
+            vec3 to_light = vec3(light.position[0], light.position[1], light.position[2]) - point;
+            light_distance = length(to_light);
+            if (light_distance < 1e-4) {
+                continue;
+            }
+            L = to_light / light_distance;
+
+            if (light.type == 2) {
+                vec3 spot_dir = normalize(vec3(
+                    light.spotDirection[0],
+                    light.spotDirection[1],
+                    light.spotDirection[2]));
+                float cos_angle = dot(-L, spot_dir);
+                float denom = max(
+                    light.spotInnerCos - light.spotOuterCos, 1e-4);
+                spot_attenuation = clamp(
+                    (cos_angle - light.spotOuterCos) / denom,
+                    0.0, 1.0);
+                spot_attenuation = spot_attenuation * spot_attenuation *
+                                   (3.0 - 2.0 * spot_attenuation);
+                if (spot_attenuation <= 0.0) {
+                    continue;
+                }
+            }
+        }
+
+        vec3 visibility = shadow_attenuation(point, L, light_distance);
+        if (max(visibility.r, max(visibility.g, visibility.b)) <= 0.0) {
+            continue;
+        }
+
+        vec3 light_color = vec3(light.color[0], light.color[1], light.color[2]) * light.intensity;
+        light_color *= visibility;
+        if (light.type != 0) {
+            light_color *= 1.0 / max(light_distance * light_distance, 1e-4);
+        }
+        if (light.type == 2) {
+            light_color *= spot_attenuation;
+        }
+        if (light.type == 3) {
+            light_color *= area_scale;
+        }
+        float ndotl = max(dot(N, L), 0.0);
+        if (ndotl <= 0.0) {
+            continue;
+        }
+
+        vec3 H = normalize(V + L);
+        float ndotv = max(dot(N, V), 1e-4);
+        float ndoth = max(dot(N, H), 0.0);
+        float vdoth = max(dot(V, H), 0.0);
+
+        vec3 F = fresnelSchlick(vdoth, f0);
+        float D = distributionGGX(ndoth, roughness);
+        float G = geometrySmith(ndotv, ndotl, roughness);
+
+        vec3 specular = (D * G * F) / max(4.0 * ndotv * ndotl, 1e-4);
+        vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
+        vec3 diffuse = kd * base_color / PI;
+        result += (diffuse + specular) * light_color * ndotl;
+
+        if (clearcoat > 0.0) {
+            float cc_rough = clamp(clearcoat_roughness, 0.04, 1.0);
+            vec3 Fc = fresnelSchlick(vdoth, vec3(0.04));
+            float Dc = distributionGGX(ndoth, cc_rough);
+            float Gc = geometrySmith(ndotv, ndotl, cc_rough);
+            vec3 cc_spec = (Dc * Gc * Fc) /
+                           max(4.0 * ndotv * ndotl, 1e-4);
+            result += clearcoat * cc_spec * light_color * ndotl;
+        }
+    }
+    return result;
+}
+vec3 acesFilm(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+float lineSDF(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a;
+    vec2 ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+vec3 draw_light_gizmos(vec3 color, ivec2 pixel, ivec2 image_size) {
+    vec2 p = vec2(pixel) + vec2(0.5);
+    vec2 resolution = vec2(image_size);
+    float aspect = resolution.x / resolution.y;
+
+    vec3 cam_pos = vec3(pc.cameraPosition[0], pc.cameraPosition[1], pc.cameraPosition[2]);
+    vec3 cam_forward = vec3(pc.cameraForward[0], pc.cameraForward[1], pc.cameraForward[2]);
+    vec3 cam_right = vec3(pc.cameraRight[0], pc.cameraRight[1], pc.cameraRight[2]);
+    vec3 cam_up = vec3(pc.cameraUp[0], pc.cameraUp[1], pc.cameraUp[2]);
+
+    const float RADIUS = 11.0;
+    const float STROKE = 2.0;
+    const float INNER = 6.5;
+
+    int light_count = lights.length();
+    for (int i = 0; i < light_count; ++i) {
+        GPULight light = lights[i];
+        if (light.intensity <= 0.0) {
+            continue;
+        }
+
+        vec2 center;
+        vec2 direction2d = vec2(0.0);
+
+        if (light.type == 0) {
+            center = resolution * vec2(0.12, 0.12);
+            vec3 dir = normalize(vec3(light.direction[0],
+                                      light.direction[1],
+                                      light.direction[2]));
+            direction2d = normalize(vec2(-dot(dir, cam_right),
+                                         dot(dir, cam_up)));
+        } else {
+            vec3 world_pos = vec3(light.position[0],
+                                  light.position[1],
+                                  light.position[2]);
+            vec3 rel = world_pos - cam_pos;
+            float z = dot(rel, cam_forward);
+            if (z <= 0.0) {
+                continue;
+            }
+            float ndc_x = dot(rel, cam_right) / (z * aspect);
+            float ndc_y = dot(rel, cam_up) / z;
+            center = vec2(ndc_x * 0.5 + 0.5,
+                          0.5 - ndc_y * 0.5) * resolution;
+        }
+
+        vec3 icon_color = vec3(light.color[0], light.color[1], light.color[2]);
+        icon_color = mix(icon_color, vec3(1.0), 0.35);
+
+        float d = length(p - center);
+        float fill = 1.0 - smoothstep(RADIUS - 2.0, RADIUS, d);
+        float ring = 1.0 - smoothstep(0.0, STROKE, abs(d - RADIUS));
+        float symbol = 0.0;
+
+        if (light.type == 0) {
+            vec2 a = center + direction2d * RADIUS;
+            vec2 b = center + direction2d * (RADIUS + 18.0);
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE, lineSDF(p, a, b)));
+        } else if (light.type == 1) {
+            vec2 a = center - vec2(INNER, 0.0);
+            vec2 b = center + vec2(INNER, 0.0);
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE, lineSDF(p, a, b)));
+            a = center - vec2(0.0, INNER);
+            b = center + vec2(0.0, INNER);
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE, lineSDF(p, a, b)));
+        } else if (light.type == 2) {
+            vec3 spot_dir = normalize(vec3(light.spotDirection[0],
+                                           light.spotDirection[1],
+                                           light.spotDirection[2]));
+            vec2 spot2d = normalize(vec2(dot(spot_dir, cam_right),
+                                         -dot(spot_dir, cam_up)));
+            vec2 perp2d = vec2(-spot2d.y, spot2d.x);
+
+            const float half_len = 8.0;
+            const float half_sep = 3.0;
+            float near_offset = sqrt(max(
+                RADIUS * RADIUS - half_sep * half_sep, 0.0));
+
+            vec2 near_plus =
+                center + spot2d * near_offset + perp2d * half_sep;
+            vec2 near_minus =
+                center + spot2d * near_offset - perp2d * half_sep;
+            vec2 far_plus = near_plus + spot2d * half_len;
+            vec2 far_minus = near_minus + spot2d * half_len;
+
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE,
+                                          lineSDF(p, near_plus, far_plus)));
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE,
+                                          lineSDF(p, near_minus, far_minus)));
+        } else if (light.type == 3) {
+            float arm = INNER * 0.7;
+            vec2 a1 = center - vec2(arm, arm);
+            vec2 b1 = center + vec2(arm, arm);
+            vec2 a2 = center + vec2(-arm, arm);
+            vec2 b2 = center + vec2(arm, -arm);
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE, lineSDF(p, a1, b1)));
+            symbol = max(symbol,
+                         1.0 - smoothstep(0.0, STROKE, lineSDF(p, a2, b2)));
+        }
+
+        color = mix(color, icon_color, fill * 0.25);
+        color = mix(color, vec3(1.0), max(ring, symbol) * 0.9);
+    }
+    return color;
+}
+bool refract_dir(vec3 incident, vec3 normal, float eta, out vec3 refracted) {
+    float cos_theta = clamp(-dot(incident, normal), 0.0, 1.0);
+    float k = 1.0 - eta * eta * (1.0 - cos_theta * cos_theta);
+    if (k < 0.0) {
+        return false;
+    }
+    refracted = normalize(eta * incident + (eta * cos_theta - sqrt(k)) * normal);
+    return true;
+}
+
+vec3 cosine_hemisphere(vec3 normal, float u1, float u2) {
+    const float pi = 3.14159265359;
+    vec3 up = (abs(normal.y) < 0.999)
+                  ? vec3(0.0, 1.0, 0.0)
+                  : vec3(0.0, 0.0, 1.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    float r = sqrt(u1);
+    float phi = 2.0 * pi * u2;
+    vec3 local = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u1)));
+    return normalize(tangent * local.x + bitangent * local.y +
+                     normal * local.z);
+}
+vec3 importance_sample_ggx(vec3 normal, float roughness,
+                           float u1, float u2) {
+    const float pi = 3.14159265359;
+    float a = roughness * roughness;
+    float phi = 2.0 * pi * u1;
+    float cos_theta = sqrt((1.0 - u2) / (1.0 + (a * a - 1.0) * u2));
+    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+
+    vec3 h_local = vec3(sin_theta * cos(phi),
+                        sin_theta * sin(phi),
+                        cos_theta);
+
+    vec3 up = (abs(normal.y) < 0.999)
+                  ? vec3(0.0, 1.0, 0.0)
+                  : vec3(0.0, 0.0, 1.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * h_local.x + bitangent * h_local.y +
+                     normal * h_local.z);
+}
+float luminance_of(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 direction_from_uv(vec2 uv) {
+    float phi = (uv.x - 0.5) * 2.0 * 3.14159265359;
+    float theta = uv.y * 3.14159265359;
+    float sin_theta = sin(theta);
+    return vec3(sin_theta * cos(phi), cos(theta), sin_theta * sin(phi));
+}
+
+EnvSampleEntry sample_env_entry(float u0, float u1) {
+    int count = int(envSamples.length());
+    int i = clamp(int(u0 * float(count)), 0, count - 1);
+    EnvSampleEntry base = envSamples[i];
+    int chosen = (u1 < base.probability) ? i : int(base.alias);
+    return envSamples[chosen];
+}
+
+vec3 env_sample_direction(EnvSampleEntry entry, out float pdf,
+                          out vec3 color) {
+    vec2 sample_size = vec2(
+        max(float(pc.environmentSampleWidth), 1.0),
+        max(float(pc.environmentSampleHeight), 1.0));
+    vec2 uv = (vec2(float(entry.x), float(entry.y)) + 0.5) / sample_size;
+    vec3 direction = direction_from_uv(uv);
+    direction = rotate_environment_y(direction, pc.environmentRotation);
+
+    pdf = entry.pdf;
+    color = textureLod(envTexture, uv, 0).rgb * pc.environmentIntensity;
+    return direction;
+}
+
+float environment_pdf(vec3 direction) {
+    vec2 uv = direction_to_uv(direction);
+    vec3 color = textureLod(envTexture, uv, 0).rgb *
+                 pc.environmentIntensity;
+    return max(luminance_of(color) * pc.environmentPdfScale, 0.0);
+}
+
+vec3 evaluate_bsdf(vec3 N, vec3 V, vec3 L, vec3 base_color,
+                   float metallic, float roughness, float transmission,
+                   vec3 f0, float clearcoat, float clearcoat_roughness) {
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) {
+        return vec3(0.0);
+    }
+
+    float ndotv = max(dot(N, V), 1e-4);
+    vec3 H = normalize(V + L);
+    float ndoth = max(dot(N, H), 0.0);
+    float vdoth = max(dot(V, H), 0.0);
+
+    vec3 F = fresnelSchlick(vdoth, f0);
+    float D = distributionGGX(ndoth, roughness);
+    float G = geometrySmith(ndotv, ndotl, roughness);
+
+    vec3 specular = (D * G * F) / max(4.0 * ndotv * ndotl, 1e-4);
+    vec3 diffuse = base_color * (1.0 - metallic) * (1.0 - transmission) / PI;
+    vec3 result = diffuse + specular;
+
+    if (clearcoat > 0.0) {
+        float cc_rough = clamp(clearcoat_roughness, 0.04, 1.0);
+        vec3 Fc = fresnelSchlick(vdoth, vec3(0.04));
+        float Dc = distributionGGX(ndoth, cc_rough);
+        float Gc = geometrySmith(ndotv, ndotl, cc_rough);
+        vec3 cc_spec = (Dc * Gc * Fc) / max(4.0 * ndotv * ndotl, 1e-4);
+        result += clearcoat * cc_spec;
+    }
+
+    return result;
+}
+
+float evaluate_bsdf_pdf(vec3 N, vec3 V, vec3 L, float metallic,
+                        float roughness) {
+    float ndotl = max(dot(N, L), 0.0);
+    if (ndotl <= 0.0) {
+        return 0.0;
+    }
+
+    float ndotv = max(dot(N, V), 1e-4);
+    vec3 H = normalize(V + L);
+    float ndoth = max(dot(N, H), 0.0);
+    float vdoth = max(dot(V, H), 0.0);
+
+    float D = distributionGGX(ndoth, roughness);
+    float pdf_specular = D * ndoth / max(4.0 * vdoth, 1e-4);
+    float pdf_diffuse = ndotl / PI;
+    return mix(pdf_diffuse, pdf_specular, metallic);
+}
+float random01(vec2 p, float offset) {
+    return fract(sin(dot(p + vec2(offset, offset * 0.37),
+                          vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+struct SecondaryHit {
+    vec3 point;
+    vec3 normal;
+    vec3 baseColor;
+    float metallic;
+    float roughness;
+    float transmission;
+    float ior;
+    float thicknessFactor;
+    float attenuationColor[3];
+    float attenuationDistance;
+    vec3 emissive;
+    float occlusion;
+    float specularFactor;
+    float specularColorFactor[3];
+    float clearcoatFactor;
+    float clearcoatRoughness;
+    int flipUvY;
+};
+
+bool trace_secondary(vec3 ray_origin, vec3 ray_dir, out SecondaryHit hit) {
+    float closest = 1e30;
+    int hit_index = -1;
+    float hit_u = 0.0;
+    float hit_v = 0.0;
+
+    int stack[128];
+    int stack_size = 0;
+    stack[stack_size++] = 0;
+
+    while (stack_size > 0) {
+        BVHNode node = bvhNodes[stack[--stack_size]];
+        if (!hit_aabb(node, ray_origin, ray_dir, closest)) {
+            continue;
+        }
+
+        if (node.left < 0) {
+            for (int i = node.start; i < node.start + node.count; ++i) {
+                Triangle tri = triangles[i];
+                Vertex a = vertices[tri.v0];
+                Vertex b = vertices[tri.v1];
+                Vertex c = vertices[tri.v2];
+                float t;
+                float u;
+                float v;
+                if (hit_triangle(positionOf(a), positionOf(b), positionOf(c),
+                                 ray_origin, ray_dir, t, u, v)) {
+                    if (t > 0.0 && t < closest) {
+                        Material material = materials[tri.materialIndex];
+                        float w = 1.0 - u - v;
+                        vec3 normal = normalize(
+                            w * normalOf(a) + u * normalOf(b) +
+                            v * normalOf(c));
+                        // A volume boundary is two-sided: KHR_materials_volume
+                        // states that doubleSided has no effect on it.
+                        if (material.doubleSided == 0 &&
+                            material.thickness <= 0.0 &&
+                            dot(normal, ray_dir) > 0.0) {
+                            continue;
+                        }
+
+                        float alpha = material_alpha(
+                            material, u, v, a, b, c);
+                        if (material.alphaMode == 1 &&
+                            alpha < material.alphaCutoff) {
+                            continue;
+                        }
+                        if (material.alphaMode == 2) {
+                            float rnd = random01(
+                                vec2(gl_GlobalInvocationID.xy),
+                                float(pc.frameIndex) * 41.0 +
+                                    float(i) * 13.0 + 12.0);
+                            if (rnd > alpha) {
+                                continue;
+                            }
+                        }
+
+                        closest = t;
+                        hit_index = i;
+                        hit_u = u;
+                        hit_v = v;
+                    }
+                }
+            }
+        } else {
+            if (node.right >= 0) stack[stack_size++] = node.right;
+            if (node.left >= 0) stack[stack_size++] = node.left;
+        }
+    }
+
+    float ground_t;
+    vec3 ground_point;
+    if (hit_ground_disk(ray_origin, ray_dir, -0.45, 2.5, ground_t, ground_point) &&
+        ground_t < closest) {
+        hit.point = ground_point;
+        hit.normal = (ray_dir.y < 0.0) ? vec3(0.0, 1.0, 0.0)
+                                       : vec3(0.0, -1.0, 0.0);
+        hit.baseColor = vec3(0.30, 0.30, 0.32);
+        hit.metallic = 0.0;
+        hit.roughness = 0.85;
+        hit.transmission = 0.0;
+        hit.ior = 1.5;
+        hit.thicknessFactor = 0.0;
+        hit.attenuationColor[0] = 1.0;
+        hit.attenuationColor[1] = 1.0;
+        hit.attenuationColor[2] = 1.0;
+        hit.attenuationDistance = 1e30;
+        hit.emissive = vec3(0.0);
+        hit.occlusion = 1.0;
+        return true;
+    }
+
+    if (hit_index < 0) {
+        return false;
+    }
+
+    Triangle tri = triangles[hit_index];
+    Vertex a = vertices[tri.v0];
+    Vertex b = vertices[tri.v1];
+    Vertex c = vertices[tri.v2];
+
+    float w = 1.0 - hit_u - hit_v;
+    vec3 normal = normalize(w * normalOf(a) + hit_u * normalOf(b) +
+                            hit_v * normalOf(c));
+
+    vec2 uv0 = vec2(a.uv[0], a.uv[1]);
+    vec2 uv1 = vec2(b.uv[0], b.uv[1]);
+    vec2 uv2 = vec2(c.uv[0], c.uv[1]);
+    vec2 texcoord = w * uv0 + hit_u * uv1 + hit_v * uv2;
+    Material material = materials[tri.materialIndex];
+    vec2 sampleUV = texcoord;
+    if (material.flipUvY != 0) {
+        sampleUV.y = 1.0 - sampleUV.y;
+    }
+
+    // UV footprint of this ray on the surface, used for mip selection.
+    vec3 p0 = positionOf(a);
+    vec3 p1 = positionOf(b);
+    vec3 p2 = positionOf(c);
+    float uv_per_world = max(
+        length(uv1 - uv0) / max(length(p1 - p0), 1e-8),
+        length(uv2 - uv0) / max(length(p2 - p0), 1e-8));
+    float uv_span = closest * max(g_ray_spread, 1e-6) * uv_per_world;
+
+    vec3 base_color = vec3(material.baseColor[0],
+                           material.baseColor[1],
+                           material.baseColor[2]);
+    if (material.baseColorSlot >= 0) {
+        // The sRGB array returns linear values, so no manual gamma decode.
+        vec4 sampleColor = sample_srgb(material.baseColorSlot, sampleUV, uv_span);
+        base_color *= max(sampleColor.rgb, vec3(0.0));
+    }
+
+    float metallic = material.metallic;
+    float roughness = material.roughness;
+    if (material.metallicRoughnessSlot >= 0) {
+        vec4 mr = sample_linear(
+            material.metallicRoughnessSlot, sampleUV, uv_span);
+        roughness *= mr.g;
+        metallic *= mr.b;
+    }
+
+    float occlusion = 1.0;
+    if (material.occlusionSlot >= 0) {
+        occlusion = sample_linear(material.occlusionSlot, sampleUV, uv_span).r;
+    }
+
+    vec3 emissive = vec3(material.emissive[0],
+                         material.emissive[1],
+                         material.emissive[2]);
+    if (material.emissiveSlot >= 0) {
+        emissive *= max(
+            sample_srgb(material.emissiveSlot, sampleUV, uv_span).rgb,
+            vec3(0.0));
+    }
+    emissive *= material.emissiveStrength;
+
+    if (material.normalSlot >= 0) {
+        vec3 tangent_normal =
+            sample_linear(material.normalSlot, sampleUV, uv_span).xyz * 2.0 -
+            1.0;
+        tangent_normal.xy *= material.normalScale;
+
+        // Cotangent frame derived from the hit triangle, so no TANGENT
+        // attribute is required.
+        vec3 frame_normal = normalize(normal);
+        if (dot(frame_normal, ray_dir) > 0.0) {
+            frame_normal = -frame_normal;
+        }
+        float uv_v_sign = (material.flipUvY != 0) ? -1.0 : 1.0;
+        vec2 duv0 = vec2(uv1.x - uv0.x, (uv1.y - uv0.y) * uv_v_sign);
+        vec2 duv1 = vec2(uv2.x - uv0.x, (uv2.y - uv0.y) * uv_v_sign);
+        vec3 edge1 = p1 - p0;
+        vec3 edge2 = p2 - p0;
+        float det = duv0.x * duv1.y - duv0.y * duv1.x;
+        vec3 tangent;
+        vec3 bitangent;
+        if (abs(det) > 1e-12) {
+            tangent = (edge1 * duv1.y - edge2 * duv0.y) / det;
+            bitangent = (edge2 * duv0.x - edge1 * duv1.x) / det;
+        } else {
+            vec3 helper = abs(frame_normal.y) < 0.99
+                              ? vec3(0.0, 1.0, 0.0)
+                              : vec3(1.0, 0.0, 0.0);
+            tangent = cross(helper, frame_normal);
+            bitangent = cross(frame_normal, tangent);
+        }
+        tangent = normalize(tangent - frame_normal * dot(frame_normal, tangent));
+        bitangent =
+            normalize(bitangent - frame_normal * dot(frame_normal, bitangent));
+        normal = normalize(tangent * tangent_normal.x +
+                           bitangent * tangent_normal.y +
+                           frame_normal * tangent_normal.z);
+    }
+
+    hit.point = ray_origin + closest * ray_dir;
+    hit.normal = normal;
+    hit.baseColor = base_color;
+    hit.metallic = clamp(metallic, 0.0, 1.0);
+    hit.roughness = clamp(roughness, 0.04, 1.0);
+    hit.transmission = material.transmission;
+    hit.ior = material.ior;
+
+    // The thickness texture is deliberately not sampled: KHR_materials_volume
+    // tells ray tracers to use the measured distance through the volume, which
+    // the transmission path does instead.
+    hit.thicknessFactor = material.thickness;
+
+    hit.attenuationColor[0] = material.attenuationColor[0];
+    hit.attenuationColor[1] = material.attenuationColor[1];
+    hit.attenuationColor[2] = material.attenuationColor[2];
+    hit.attenuationDistance = material.attenuationDistance;
+    hit.emissive = emissive;
+    hit.occlusion = occlusion;
+    hit.specularFactor = material.specularFactor;
+    hit.specularColorFactor[0] = material.specularColorFactor[0];
+    hit.specularColorFactor[1] = material.specularColorFactor[1];
+    hit.specularColorFactor[2] = material.specularColorFactor[2];
+    hit.clearcoatFactor = material.clearcoatFactor;
+    hit.clearcoatRoughness = material.clearcoatRoughness;
+    return true;
+}
+
+float hash12(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 ray_color(vec3 ray_origin, vec3 ray_dir, vec2 uv, float time) {
+    vec3 throughput = vec3(1.0);
+    vec3 accumulated = vec3(0.0);
+
+    const int MAX_BOUNCES = 6;
+    // Medium of the volume the ray is currently travelling through. Absorption
+    // uses the distance actually travelled, not the authored thickness.
+    bool inside_medium = false;
+    vec3 medium_color = vec3(1.0);
+    float medium_distance = 1e30;
+    float lastBsdfPdf = 0.0;
+
+    for (int bounce = 0; bounce < MAX_BOUNCES; ++bounce) {
+        SecondaryHit hit;
+        if (!trace_secondary(ray_origin, ray_dir, hit)) {
+            vec3 envColor = environment_color(ray_dir);
+            if (bounce == 0) {
+                accumulated += throughput * envColor;
+            } else {
+                float envPdf = environment_pdf(ray_dir);
+                float misWeight = 1.0;
+                if (lastBsdfPdf > 1e-6) {
+                    misWeight = envPdf / (envPdf + lastBsdfPdf);
+                }
+                accumulated += throughput * envColor * misWeight;
+            }
+            break;
+        }
+
+        vec3 geometric_normal = normalize(hit.normal);
+        // Beer-Lambert over the segment the ray just travelled inside a volume:
+        // T(x) = attenuationColor^(x / attenuationDistance), with x taken from
+        // the actual geometry instead of the baked thickness texture.
+        if (inside_medium) {
+            float travelled = length(hit.point - ray_origin);
+            throughput *=
+                pow(medium_color, vec3(travelled / medium_distance));
+        }
+        // A rough bounce widens the cone used for the next texture lookups.
+        g_ray_spread = max(g_ray_spread, hit.roughness * 0.5);
+        vec3 N = (dot(geometric_normal, ray_dir) < 0.0)
+                     ? geometric_normal
+                     : -geometric_normal;
+        vec3 V = -normalize(ray_dir);
+        vec3 dielectric_f0 = min(
+            vec3(0.04) * hit.specularFactor *
+                vec3(hit.specularColorFactor[0],
+                     hit.specularColorFactor[1],
+                     hit.specularColorFactor[2]),
+            vec3(1.0));
+        vec3 f0 = mix(dielectric_f0, hit.baseColor, hit.metallic);
+        vec3 diffuse_color = hit.baseColor * (1.0 - hit.transmission);
+
+        vec3 direct = direct_lighting(
+            N, V, hit.point, diffuse_color, hit.metallic, hit.roughness, f0,
+            hit.clearcoatFactor, hit.clearcoatRoughness);
+        accumulated += throughput * (hit.emissive + direct);
+
+        if (hit.transmission <= 0.0) {
+            float envU0 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 23.0 + float(bounce) * 47.0 + 8.0);
+            float envU1 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 29.0 + float(bounce) * 53.0 + 9.0);
+
+            EnvSampleEntry envEntry = sample_env_entry(envU0, envU1);
+            float envPdf = 0.0;
+            vec3 envColor = vec3(0.0);
+            vec3 envDir = env_sample_direction(envEntry, envPdf, envColor);
+
+            float envNdotL = dot(N, envDir);
+            if (envNdotL > 0.0 && envPdf > 1e-6) {
+                vec3 visibility =
+                    shadow_attenuation(hit.point, envDir, 1e30);
+                if (max(visibility.r,
+                        max(visibility.g, visibility.b)) > 0.0) {
+                    vec3 bsdf = evaluate_bsdf(
+                        N, V, envDir, hit.baseColor, hit.metallic,
+                        hit.roughness, hit.transmission, f0,
+                        hit.clearcoatFactor, hit.clearcoatRoughness);
+                    float bsdfPdf = evaluate_bsdf_pdf(
+                        N, V, envDir, hit.metallic, hit.roughness);
+                    float misWeight = bsdfPdf / (bsdfPdf + envPdf);
+                    accumulated += throughput * bsdf * envColor *
+                                   envNdotL * misWeight / envPdf *
+                                   visibility;
+                }
+            }
+        }
+
+        float rnd = random01(
+            vec2(gl_GlobalInvocationID.xy),
+            float(pc.frameIndex) * 17.0 + float(bounce) * 31.0 + 0.5);
+
+        if (hit.transmission > 0.0) {
+            bool entering = dot(ray_dir, geometric_normal) < 0.0;
+            vec3 outward = entering ? geometric_normal : -geometric_normal;
+            float eta = entering ? (1.0 / max(hit.ior, 1.0))
+                                 : max(hit.ior, 1.0);
+
+            vec3 reflection_dir = reflect(ray_dir, N);
+            vec3 refraction_dir;
+            bool total_internal =
+                !refract_dir(ray_dir, outward, eta, refraction_dir);
+
+            float cos_theta =
+                clamp(abs(dot(ray_dir, geometric_normal)), 0.0, 1.0);
+            vec3 F = fresnelSchlick(cos_theta, vec3(0.04));
+
+            if (total_internal || rnd < F.r) {
+                ray_dir = reflection_dir;
+            } else {
+                ray_dir = refraction_dir;
+                throughput *= hit.baseColor;
+
+                // Track the medium so the next segment can be absorbed with the
+                // real distance it travels through it.
+                if (entering) {
+                    inside_medium = hit.thicknessFactor > 0.0 &&
+                                    hit.attenuationDistance < 1e29;
+                    medium_color = vec3(hit.attenuationColor[0],
+                                        hit.attenuationColor[1],
+                                        hit.attenuationColor[2]);
+                    medium_distance = max(hit.attenuationDistance, 1e-4);
+                } else {
+                    inside_medium = false;
+                }
+            }
+
+            ray_origin = hit.point + ray_dir * 1e-3;
+            continue;
+        }
+
+        if (rnd < hit.metallic) {
+            float ndotv = max(dot(N, V), 1e-4);
+            float u1 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 13.0 + float(bounce) * 41.0 + 6.0);
+            float u2 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 17.0 + float(bounce) * 43.0 + 7.0);
+
+            vec3 H = importance_sample_ggx(
+                N, clamp(hit.roughness, 0.04, 1.0), u1, u2);
+            vec3 L = reflect(ray_dir, H);
+            float ndotl = dot(N, L);
+            if (ndotl <= 0.0) {
+                break;
+            }
+
+            float ndoth = max(dot(N, H), 0.0);
+            float vdoth = max(dot(V, H), 0.0);
+            float rough = clamp(hit.roughness, 0.04, 1.0);
+            vec3 F = fresnelSchlick(vdoth, hit.baseColor);
+            float G = geometrySmith(ndotv, ndotl, rough);
+            float weight = G * vdoth / max(ndotv * ndoth, 1e-4);
+            float D = distributionGGX(ndoth, rough);
+            lastBsdfPdf = D * ndoth / max(4.0 * vdoth, 1e-4);
+            throughput *= F * weight;
+            ray_dir = L;
+        } else {
+            float xi1 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 11.0 + float(bounce) * 23.0 + 3.0);
+            float xi2 = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 19.0 + float(bounce) * 29.0 + 4.0);
+            ray_dir = cosine_hemisphere(N, xi1, xi2);
+            lastBsdfPdf = max(dot(N, ray_dir), 0.0) / PI;
+            throughput *= hit.baseColor * (1.0 - hit.metallic);
+        }
+
+        ray_origin = hit.point + N * 1e-3;
+
+        if (bounce > 2) {
+            float survival = clamp(
+                max(throughput.r, max(throughput.g, throughput.b)),
+                0.05, 0.95);
+            float roulette = random01(
+                vec2(gl_GlobalInvocationID.xy),
+                float(pc.frameIndex) * 31.0 + float(bounce) * 37.0 + 5.0);
+            if (roulette > survival) {
+                break;
+            }
+            throughput /= survival;
+        }
+    }
+
+    return accumulated;
+}
+vec3 make_ray_direction(vec2 uv, float aspect) {
+    vec2 screen = uv * 2.0 - 1.0;
+    screen.x *= aspect;
+    screen.y = -screen.y;
+    vec3 forward = vec3(pc.cameraForward[0], pc.cameraForward[1], pc.cameraForward[2]);
+    vec3 right = vec3(pc.cameraRight[0], pc.cameraRight[1], pc.cameraRight[2]);
+    vec3 up = vec3(pc.cameraUp[0], pc.cameraUp[1], pc.cameraUp[2]);
+    return normalize(forward * 1.5 + right * screen.x + up * screen.y);
+}
+
+void main() {
+    ivec2 image_size = imageSize(displayImage);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    if (pixel.x >= image_size.x || pixel.y >= image_size.y) {
+        return;
+    }
+
+    float aspect = float(image_size.x) / float(image_size.y);
+    // Vertical angular size of one pixel: the projection uses a focal length of
+    // 1.5 for a screen span of [-1, 1].
+    g_ray_spread = (2.0 / 1.5) / float(image_size.y);
+    vec3 ray_origin = vec3(
+        pc.cameraPosition[0],
+        pc.cameraPosition[1],
+        pc.cameraPosition[2]);
+    vec3 accumulated = vec3(0.0);
+
+    for (int sy = 0; sy < SAMPLES_Y; ++sy) {
+        for (int sx = 0; sx < SAMPLES_X; ++sx) {
+            float jitter_x = hash12(vec2(pixel) + vec2(float(pc.frameIndex) * 17.0 + float(sx) * 13.0, float(pc.frameIndex) * 31.0 + float(sy) * 71.0));
+            float jitter_y = hash12(vec2(pixel) + vec2(float(pc.frameIndex) * 43.0 + float(sx) * 29.0, float(pc.frameIndex) * 59.0 + float(sy) * 47.0));
+            vec2 offset = (vec2(float(sx), float(sy)) + vec2(jitter_x, jitter_y)) /
+                          vec2(float(SAMPLES_X), float(SAMPLES_Y));
+            vec2 uv = (vec2(pixel) + offset) / vec2(image_size);
+            vec3 ray_dir = make_ray_direction(uv, aspect);
+            accumulated += ray_color(ray_origin, ray_dir, uv, pc.time);
+        }
+    }
+
+    vec3 color = accumulated / float(SAMPLE_COUNT);
+    color = min(color, vec3(8.0));
+
+    vec4 previous = (pc.frameIndex == 0)
+                        ? vec4(0.0)
+                        : imageLoad(accumImage, pixel);
+    vec4 total = previous + vec4(color, 1.0);
+    imageStore(accumImage, pixel, total);
+
+    vec3 resolved = total.rgb / float(pc.frameIndex + 1);
+    resolved *= pc.exposure;
+    resolved = acesFilm(resolved);
+    if (pc.showLightGizmos != 0) {
+        resolved = draw_light_gizmos(resolved, pixel, image_size);
+    }
+    imageStore(displayImage, pixel, vec4(resolved, 1.0));
+}
